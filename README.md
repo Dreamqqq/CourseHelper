@@ -5,7 +5,7 @@
 ## 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展
-2. 新建脚本，将 `auto-course-helper.user.js` 内容粘贴保存
+2. 新建脚本，将 `course-helper.user.js` 内容粘贴保存
 3. 访问智云平台课程页面即可使用
 
 ## 功能
