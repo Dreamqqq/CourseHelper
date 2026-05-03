@@ -27,13 +27,17 @@
     autoStart: false
   };
 
-  const ACTIVE_BG = 'rgb(232, 243, 255)';
+  const ACTIVE_BGS = new Set([
+    'rgb(232, 243, 255)',
+    'rgb(247, 248, 250)',
+  ]);
 
   // ==================== 页面识别 ====================
 
   const H = () => window.location.href;
   const isVideo = () => H().includes('/video');
-  const isDoc = () => H().includes('/document') || H().includes('/attachment') || H().includes('/attach');
+  const isAttachPageByUrl = () => /\/attach(?:ment)?(?:\/|$|[?#])/i.test(H());
+  const isDoc = () => H().includes('/document') || isAttachPageByUrl();
   const isList = () => H().includes('/courses/') && !isVideo() && !isDoc();
 
   // ==================== 生命周期管理 ====================
@@ -87,24 +91,113 @@
 
   // ==================== 侧边栏导航 ====================
 
+  function getResourceTypeFromItem(li) {
+    if (!li) return '';
+    const directChildren = Array.from(li.children || []);
+    for (const child of directChildren) {
+      const text = (child.textContent || '').trim();
+      if (text === '视频') return 'video';
+      if (text === '文档') return 'document';
+      if (text === '附件') return 'attach';
+    }
+    return '';
+  }
+
   function getResourceItems() {
-    const items = [];
-    document.querySelectorAll('li').forEach(li => {
-      if (!li.classList.contains('list-item')) return;
-      const t = li.textContent.trim();
-      if (t.length < 80 && (t.includes('视频') || t.includes('文档') || t.includes('附件'))) {
-        items.push(li);
+    return Array.from(document.querySelectorAll('li'))
+      .filter(li => !!getResourceTypeFromItem(li));
+  }
+
+  function extractResourceKeyFromUrl(url) {
+    if (!url) return '';
+    try {
+      const u = new URL(url, window.location.origin);
+      const paramKeys = ['resourceId', 'resId', 'id', 'catalogId', 'taskId', 'chapterId'];
+      for (const k of paramKeys) {
+        const v = u.searchParams.get(k);
+        if (v) return `${k}:${v}`;
       }
-    });
-    return items;
+
+      const m = u.pathname.match(/\/(\d+)(?=\/(?:video|document|attach|attachment)(?:\/|$))/i);
+      if (m) return `path:${m[1]}`;
+    } catch (_) {}
+    return '';
+  }
+
+  function extractResourceKeyFromElement(li) {
+    if (!li) return '';
+
+    const dataKeys = ['resourceId', 'resId', 'id', 'catalogId', 'taskId', 'chapterId'];
+    for (const k of dataKeys) {
+      const datasetVal = li.dataset?.[k];
+      if (datasetVal) return `${k}:${datasetVal}`;
+
+      const dataAttrVal = li.getAttribute(`data-${k.replace(/[A-Z]/g, s => `-${s.toLowerCase()}`)}`);
+      if (dataAttrVal) return `${k}:${dataAttrVal}`;
+    }
+
+    const link = li.querySelector('a[href]');
+    if (link) {
+      const byHref = extractResourceKeyFromUrl(link.href);
+      if (byHref) return byHref;
+    }
+
+    return '';
+  }
+
+  function getCurrentResourceIndex(items) {
+    if (!items.length) return -1;
+
+    // 1) 优先用 URL / resourceId 精确定位当前项
+    const currentKey = extractResourceKeyFromUrl(H());
+    if (currentKey) {
+      for (let i = 0; i < items.length; i++) {
+        const itemKey = extractResourceKeyFromElement(items[i]);
+        if (itemKey && itemKey === currentKey) return i;
+      }
+    }
+
+    // 2) 再看常见 active/current/selected 标记（按 class token 精确匹配，避免 catalog-active 误判）
+    const isExactStateClass = (cls) => {
+      const tokens = (cls || '').toLowerCase().split(/\s+/).filter(Boolean);
+      return tokens.includes('active') || tokens.includes('current') || tokens.includes('selected') || tokens.includes('is-active');
+    };
+    for (let i = 0; i < items.length; i++) {
+      const li = items[i];
+      const cls = (li.className || '').toString();
+      const ariaCurrent = li.getAttribute('aria-current');
+      if (
+        isExactStateClass(cls) ||
+        ariaCurrent === 'true'
+      ) return i;
+    }
+
+    // 3) 回退：按背景色识别当前项
+    for (let i = 0; i < items.length; i++) {
+      const bg = window.getComputedStyle(items[i]).backgroundColor;
+      if (ACTIVE_BGS.has(bg)) return i;
+    }
+
+    return -1;
+  }
+
+  function getCurrentResourceType() {
+    const items = getResourceItems();
+    const cur = getCurrentResourceIndex(items);
+    if (cur < 0) return '';
+    return getResourceTypeFromItem(items[cur]);
+  }
+
+  function isAttachmentContext() {
+    // 同时满足 URL 像附件页，且当前侧边栏资源确实是“附件”，才执行附件跳过
+    return isAttachPageByUrl() && getCurrentResourceType() === 'attach';
   }
 
   function findNextResource() {
     const items = getResourceItems();
-    for (let i = 0; i < items.length; i++) {
-      if (window.getComputedStyle(items[i]).backgroundColor === ACTIVE_BG && i + 1 < items.length) {
-        return items[i + 1];
-      }
+    const cur = getCurrentResourceIndex(items);
+    if (cur >= 0 && cur + 1 < items.length) {
+      return items[cur + 1];
     }
     return null;
   }
@@ -211,8 +304,8 @@
     await sleep(2000);
     if (generation !== gen) return;
 
-    // 附件页面（/attach）跳过，直接切换下一项
-    if (H().includes('/attach')) {
+    // 附件资源才跳过，避免误伤普通文档
+    if (isAttachmentContext()) {
       log('附件页面，跳过');
       updateStatus('附件，跳过...');
       await sleep(500);
@@ -243,8 +336,21 @@
     }
     log(`文档总页数: ${totalPages || '?'}`);
 
-    await docScrollToBottom(totalPages || 1, gen);
+    let reachedBottom = await docScrollToBottom(totalPages || 1, gen);
     if (generation !== gen) return;
+
+    if (!reachedBottom) {
+      log('首次滚动后未确认到底，进行二次滚动校验');
+      updateStatus('文档未到底，继续滚动...');
+      reachedBottom = await docScrollToBottom(Math.max(totalPages || 1, 2), gen);
+      if (generation !== gen) return;
+    }
+
+    if (!reachedBottom) {
+      log('文档滚动未到达底部，停止自动跳转');
+      updateStatus('文档未到底，请稍后重试');
+      return;
+    }
 
     log('底部停留 1s');
     updateStatus('已到底, 1秒后切换...');
@@ -254,6 +360,45 @@
     log('文档处理完成');
     updateStatus('文档完成，准备切换...');
     clickNext();
+  }
+
+  function getDocScrollState(container) {
+    if (container) {
+      const max = Math.max(0, container.scrollHeight - container.clientHeight);
+      const top = Math.max(0, container.scrollTop);
+      return { top, max };
+    }
+    const root = document.documentElement;
+    const max = Math.max(0, root.scrollHeight - window.innerHeight);
+    const top = Math.max(0, window.scrollY || root.scrollTop || 0);
+    return { top, max };
+  }
+
+  async function waitDocBottomStable(container, gen) {
+    let nearBottomStreak = 0;
+    let lastMax = -1;
+
+    for (let i = 0; i < 30; i++) { // 最多约 6 秒
+      if (generation !== gen) return false;
+
+      const { top, max } = getDocScrollState(container);
+      const nearBottom = max <= 6 || top >= (max - 8);
+
+      if (nearBottom) {
+        // 只有滚动高度相对稳定且接近底部，才算完成
+        if (lastMax >= 0 && Math.abs(max - lastMax) <= 2) nearBottomStreak++;
+        else nearBottomStreak = 1;
+      } else {
+        nearBottomStreak = 0;
+        if (container) container.scrollTop = container.scrollHeight;
+        else window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
+      }
+
+      lastMax = max;
+      await sleep(200);
+    }
+
+    return nearBottomStreak >= 4; // 连续约 0.8s 稳定接近底部
   }
 
   async function docScrollToBottom(totalPages, gen) {
@@ -276,10 +421,11 @@
       log('未找到可滚动容器, 尝试用 window 滚动');
     }
 
-    const targetScroll = container
-      ? container.scrollHeight - container.clientHeight
-      : document.documentElement.scrollHeight - window.innerHeight;
-    if (targetScroll <= 0) { log('无可滚动距离'); return; }
+    const { max: targetScroll } = getDocScrollState(container);
+    if (targetScroll <= 0) {
+      log('无可滚动距离，检查是否已在底部');
+      return await waitDocBottomStable(container, gen);
+    }
 
     const scrollTime = Math.max(totalPages * 500, 2000);
     const steps = Math.max(totalPages * 2, 15);
@@ -306,7 +452,9 @@
       window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
     }
     (container || document).dispatchEvent(new Event('scroll', { bubbles: true }));
-    log('滚动完毕');
+    const stableBottom = await waitDocBottomStable(container, gen);
+    log(stableBottom ? '滚动完毕并确认到底' : '滚动后未能确认到底');
+    return stableBottom;
   }
 
   // ==================== 资源切换 ====================
@@ -315,12 +463,27 @@
     log('切换下一资源...');
     updateStatus('切换中...');
 
-    const btn = Array.from(document.querySelectorAll('button'))
-      .find(b => b.textContent.includes('下一项') && b.offsetParent !== null);
-    if (btn) { log('点击「下一项任务」'); btn.click(); return; }
+    const nextKeywords = ['下一项', '下一节', '下一个', '下一任务'];
+    const btn = Array.from(document.querySelectorAll('button, a[role="button"], .btn'))
+      .find(el => {
+        if (el.closest('#auto-panel')) return false;
+        if (el.offsetParent === null) return false;
+        const text = (el.textContent || '').trim();
+        return nextKeywords.some(k => text.includes(k));
+      });
+    if (btn) { log('点击下一项控件:', btn.textContent.trim().slice(0, 20)); btn.click(); return; }
 
     const next = findNextResource();
     if (next) { log('侧边栏:', next.textContent.trim().substring(0, 40)); next.click(); return; }
+
+    const items = getResourceItems();
+    const cur = getCurrentResourceIndex(items);
+    if (cur === -1) {
+      log('未识别到当前资源，停止自动跳转，避免回跳到已完成内容');
+      updateStatus('未识别当前项，请手动点下一项后继续');
+      showNotice('未识别当前资源，已停止自动跳转，避免回跳');
+      return;
+    }
 
     const arts = document.querySelectorAll('article');
     let found = false;
@@ -334,7 +497,7 @@
         }, 1500);
         return;
       }
-      if (pli && window.getComputedStyle(pli).backgroundColor === ACTIVE_BG) found = true;
+      if (pli && ACTIVE_BGS.has(window.getComputedStyle(pli).backgroundColor)) found = true;
     }
     showNotice('全部资源学习完毕！');
     updateStatus('已完成');
@@ -346,6 +509,14 @@
     const st = document.getElementById('as-status');
     if (st) st.textContent = text;
     log(text);
+  }
+
+  function refreshSpeedStatusIfPlaying() {
+    if (!CONFIG._running) return;
+    if (!isVideo()) return;
+    const v = document.querySelector('video');
+    if (!v) return;
+    updateStatus(`视频播放中 (${CONFIG.videoSpeed}x, 静音)`);
   }
 
   // ==================== 控制面板（所有页面都显示，可拖拽） ====================
@@ -420,7 +591,8 @@
     document.getElementById('as-speed').onchange = e => {
       CONFIG.videoSpeed = +e.target.value;
       const v = document.querySelector('video');
-      if (v) v.playbackRate = CONFIG.videoSpeed;
+      if (v) applyVideoSettings(v);
+      refreshSpeedStatusIfPlaying();
     };
 
     document.getElementById('as-start').onclick = () => {
